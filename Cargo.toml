@@ -1,0 +1,11 @@
+[package]
+name = "proccontrol"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cgroups-rs = { git = "https://github.com/kata-containers/cgroups-rs" }
+clap = { version = "4.5.45", features = ["derive"] }
+clap_derive = "4.5.45"
+nix = "0.30.1"
+rand = "0.9"
