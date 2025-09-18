@@ -1,11 +1,14 @@
-use std::{os::unix::process::CommandExt, process::{ExitCode, ExitStatus}, sync::LazyLock};
+use std::{cell::RefCell, os::unix::process::CommandExt, process::{ExitCode, ExitStatus}, rc::Rc, sync::LazyLock};
 
 use clap::Parser;
 
 #[derive(Parser, Debug)]
 pub struct Args {
-    /// Command to run
-    #[clap(required = true)]
+    /// The command to run
+    /// 
+    /// Security notes:
+    /// - The first argument is the command itself, followed by its arguments
+    /// - The command itself must be the same user id as the caller
     command: Vec<String>,
     /// The soft memory limit in bytes
     /// If not specified, no memory limit is applied
@@ -27,6 +30,7 @@ fn setuid_help() {
 }
 
 struct CgroupDtor {
+    error_rc: Rc<RefCell<Vec<String>>>,
     cg: cgroups_rs::fs::Cgroup,
 }
 
@@ -38,20 +42,16 @@ impl Drop for CgroupDtor {
         );
 
         if let Err(e) = cg.kill() {
-            eprintln!("Failed to kill cgroup processes: {}", e);
+            self.error_rc.borrow_mut().push(format!("Failed to kill cgroup processes: {e}"));
         }
 
         if let Err(e) = cg.delete() {
-            eprintln!("Failed to delete cgroup: {}", e);
-        } else {
-            if ARGS.verbose {
-                println!("Deleted cgroup");
-            }
+            self.error_rc.borrow_mut().push(format!("Failed to delete cgroup: {e}"));
         }
     }
 }
 
-fn exec() -> Result<ExitStatus, Box<dyn std::error::Error>> {
+fn exec(cgroup_dtor_error_rc: Rc<RefCell<Vec<String>>>) -> Result<ExitStatus, Box<dyn std::error::Error>> {
     let eid = nix::unistd::geteuid();
     if !eid.is_root() {
         setuid_help();
@@ -61,6 +61,11 @@ fn exec() -> Result<ExitStatus, Box<dyn std::error::Error>> {
     if uid.is_root() {
         setuid_help();
         return Err(format!("This program must not be run as the root user itself (uid!=0). Current uid={uid}").into());
+    }
+
+    // SAFETY: Error if LD_PRELOAD is set
+    if std::env::var_os("LD_PRELOAD").is_some() {
+        return Err("LD_PRELOAD is set, refusing to run for security reasons".into());
     }
 
     let gid = nix::unistd::getgid();
@@ -76,6 +81,13 @@ fn exec() -> Result<ExitStatus, Box<dyn std::error::Error>> {
     if ARGS.command.is_empty() {
         return Err("No command specified to run".into());
     }
+
+    let cmd_name = &ARGS.command[0];
+    let cmd_args = &ARGS.command[1..];
+
+    let mut cmd = std::process::Command::new(cmd_name);
+
+    cmd.args(cmd_args);
 
     let cgroup = {        
         let cg_name = format!("ce{}", rand::random::<u64>());
@@ -111,38 +123,39 @@ fn exec() -> Result<ExitStatus, Box<dyn std::error::Error>> {
         cg
     };
 
-    let _cg_dtor = CgroupDtor { cg: cgroup };
+    let _cg_dtor = CgroupDtor { cg: cgroup, error_rc: cgroup_dtor_error_rc };
 
     // Now spawn the command
-    let command = &ARGS.command[0];
-    let command_args = &ARGS.command[1..];
-
     if ARGS.verbose {
-        println!("Spawning command: {} {:?}", command, command_args);
+        println!("Spawning command: {:?}", ARGS.command);
     }
-
-    let mut cmd = std::process::Command::new(command);
-    cmd.args(command_args);
 
     let path = _cg_dtor.cg.path().to_string();
     let cgroup_procs_file_path = format!("/sys/fs/cgroup/{}/cgroup.procs", path);
     
+    let mut id_buf= Vec::with_capacity(10); // Enough for basically all PIDs without further allocations
     unsafe {
         cmd.pre_exec(move || {
             // Write the PID to the cgroup procs file
             {
                 use std::io::Write;
+
+                // SAFETY: It is not *entirely* safe to heap allocate strings here
+                // so we need to write the pid to id_buf first then write_all to file
+                write!(&mut id_buf, "{}", std::process::id())?;
+
                 let mut file = std::fs::OpenOptions::new()
                     .write(true)
                     .open(&cgroup_procs_file_path)?;
 
-                file.write_all(std::process::id().to_string().as_bytes())?;
+                file.write_all(&id_buf)?;
                 file.flush()?;
             }
 
-            // Then drop privileges
-            
-            //println!("Dropping privileges to uid={}, gid={}", uid, gid);
+            // Drop permissions before returning Ok(())
+            //
+            // Once Ok has been returned, exec() will be called, after which
+            // we cannot control what the process does anymore
             nix::unistd::setgroups(&[gid])?;
             nix::unistd::setgid(gid)?;
             nix::unistd::setuid(uid)?;
@@ -154,7 +167,7 @@ fn exec() -> Result<ExitStatus, Box<dyn std::error::Error>> {
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            return Err(format!("Failed to spawn command '{}': {}", command, e).into());
+            return Err(format!("Failed to spawn command: {e}").into());
         }
     };
 
@@ -164,21 +177,34 @@ fn exec() -> Result<ExitStatus, Box<dyn std::error::Error>> {
 
     match child.wait() {
         Err(e) => {
-            return Err(format!("Failed to wait for command '{command}': {e}").into());
+            return Err(format!("Failed to wait for command: {e}").into());
         }
         Ok(exit_status) => {
-            if !exit_status.success() {
+            /*if !exit_status.success() {
                 std::thread::sleep(std::time::Duration::from_millis(500));
-            }
+            }*/
             return Ok(exit_status);
         }
     }
 }
 
 fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let status = exec()?;
+    let cgroup_dtor_error_rc = Rc::new(RefCell::new(Vec::new()));
+    let status = exec(cgroup_dtor_error_rc.clone())?;
+    if status.success() {
+        if cgroup_dtor_error_rc.borrow().len() > 0 {
+            return Err(cgroup_dtor_error_rc.borrow().join(", ").into());
+        }
+    }
     match status.code() {
         Some(mut code) => {
+            if cgroup_dtor_error_rc.borrow().len() > 0 {
+                // We have to hijack the exit code to indicate an error
+                // in cgroup deletion here unfortunately.
+                // TODO: Use a flag for controlling this
+                return Err(cgroup_dtor_error_rc.borrow().join(", ").into());
+            }
+
             if code < 0 {
                 code = -1 * code;
             }
@@ -188,8 +214,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             Ok(ExitCode::from(code as u8))
         },
         None => {
-            eprintln!("Process terminated due to unknown reason (signal?)");
-            Ok(ExitCode::from(1))
+            return Err("Process terminated by signal".into());
         }
     }
 }
