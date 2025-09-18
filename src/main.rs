@@ -8,7 +8,7 @@ pub struct Args {
     /// 
     /// Security notes:
     /// - The first argument is the command itself, followed by its arguments
-    /// - The command itself must be the same user id as the caller
+    /// - The command itself must be reachable by the callers user
     command: Vec<String>,
     /// The soft memory limit in bytes
     /// If not specified, no memory limit is applied
@@ -83,6 +83,12 @@ fn exec(cgroup_dtor_error_rc: Rc<RefCell<Vec<String>>>) -> Result<ExitStatus, Bo
     }
 
     let cmd_name = &ARGS.command[0];
+
+    /*let accessible = nix::unistd::access(cmd_name.as_str(), nix::unistd::AccessFlags::X_OK);
+    if let Err(e) = accessible {
+        return Err(format!("Command '{}' is not accessible or not executable: {e}", cmd_name).into());
+    }*/
+
     let cmd_args = &ARGS.command[1..];
 
     let mut cmd = std::process::Command::new(cmd_name);
