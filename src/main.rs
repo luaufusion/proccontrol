@@ -134,22 +134,17 @@ fn exec(cgroup_dtor_error_rc: Rc<RefCell<Vec<String>>>) -> Result<ExitStatus, Bo
     let path = _cg_dtor.cg.path().to_string();
     let cgroup_procs_file_path = format!("/sys/fs/cgroup/{}/cgroup.procs", path);
     
-    let mut id_buf= Vec::with_capacity(10); // Enough for basically all PIDs without further allocations
     unsafe {
         cmd.pre_exec(move || {
             // Write the PID to the cgroup procs file
             {
                 use std::io::Write;
 
-                // SAFETY: It is not *entirely* safe to heap allocate strings here
-                // so we need to write the pid to id_buf first then write_all to file
-                write!(&mut id_buf, "{}", std::process::id())?;
-
                 let mut file = std::fs::OpenOptions::new()
                     .write(true)
                     .open(&cgroup_procs_file_path)?;
 
-                file.write_all(&id_buf)?;
+                file.write_all(format!("{}", std::process::id()).as_bytes())?;
                 file.flush()?;
             }
 
