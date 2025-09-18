@@ -124,15 +124,14 @@ fn exec(args: Args, cgroup_dtor_error_rc: Rc<RefCell<Vec<String>>>) -> Result<Ex
         cmd.pre_exec(move || {
             // Write the PID to the cgroup procs file
             {
-                use std::io::Write;
-
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&cgroup_procs_file_path)?;
-
-                file.write_all(format!("{}", std::process::id()).as_bytes())?;
-                file.flush()?;
-            }
+                // Because rust File is not guaranteed to be async signal safe, we need to use raw nix
+                let fd = nix::fcntl::open(
+                    cgroup_procs_file_path.as_str(),
+                    nix::fcntl::OFlag::O_WRONLY,
+                    nix::sys::stat::Mode::empty(),
+                )?;
+                nix::unistd::write(fd, format!("{}", std::process::id()).as_bytes())?;
+            } // fd is dropped and hence closed after write (which takes ownership)
 
             // Drop permissions before returning Ok(())
             //
@@ -140,7 +139,7 @@ fn exec(args: Args, cgroup_dtor_error_rc: Rc<RefCell<Vec<String>>>) -> Result<Ex
             // we cannot control what the process does anymore
             nix::unistd::setgroups(&[gid])?;
             nix::unistd::setgid(gid)?;
-            nix::unistd::setuid(uid)?;
+            nix::unistd::setuid(uid)?; // Technically unsound on glibc but we don't spawn any threads so this should(TM) be fine
 
             Ok(())
         });
