@@ -1,4 +1,5 @@
 mod direct; // Direct execution mode using setuid binary
+mod chrootprep; // Prepares a chroot environment
 
 use std::process::ExitCode;
 use clap::{Parser, Subcommand};
@@ -35,6 +36,14 @@ enum Op {
         /// Whether to run verbosely
         #[clap(short, long, action)]
         verbose: bool,
+        /// Chroot to this directory before executing
+        /// 
+        /// Uses pivot_root always
+        #[clap(short, long)]
+        chroot: Option<String>,
+        /// Mandate full security checks and refuse to run if any fail
+        #[clap(short, long, default_value_t = false)]
+        secure: bool,
     }
 }
 
@@ -42,12 +51,14 @@ enum Op {
 fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mode = Cli::parse();
     match mode.op {
-        Op::Direct { command, memory_soft, memory_hard, verbose } => {
+        Op::Direct { command, memory_soft, memory_hard, verbose, chroot, secure } => {
             let args = Args {
                 command,
                 memory_soft,
                 memory_hard,
                 verbose,
+                chroot,
+                secure
             };
 
             direct::main(args)
