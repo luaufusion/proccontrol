@@ -1,4 +1,5 @@
 use std::{cell::RefCell, os::unix::process::CommandExt, process::{ExitCode, ExitStatus}, rc::Rc};
+use nix::mount;
 
 
 #[derive(Debug)]
@@ -11,8 +12,14 @@ pub struct Args {
     /// The hard memory limit in bytes
     /// If not specified, no memory limit is applied
     pub memory_hard: Option<i64>,
+    /// What percentage of the CPU can the process use (0-100)
+    /// If not specified, no CPU limit is applied
+    pub cpu_limit_percent: Option<u8>,
     /// Chroot to this directory before executing
     pub chroot: Option<String>,
+    /// Whether or not to use a new user namespace
+    /// *EXPERIMENTAL*
+    pub new_userns: bool,
     /// Whether to run verbosely
     pub verbose: bool,
     /// Mandate full security checks and refuse to run if any fail
@@ -50,7 +57,7 @@ fn setup_cgroup(args: &Args) -> Result<cgroups_rs::fs::Cgroup, Box<dyn std::erro
         }
 
         let cg = cgroups_rs::fs::cgroup_builder::CgroupBuilder::new(&cg_name)
-        .set_specified_controllers(vec!["memory".to_string()]);
+        .set_specified_controllers(vec!["memory".to_string(), "cpu".to_string()]);
 
         let cg = {
             let mut mem_controller = cg.memory();
@@ -62,6 +69,21 @@ fn setup_cgroup(args: &Args) -> Result<cgroups_rs::fs::Cgroup, Box<dyn std::erro
             }
 
             mem_controller.done()
+        };
+
+        let cg = {
+            let mut cpu_controller = cg.cpu();
+
+            cpu_controller = if let Some(percent) = args.cpu_limit_percent {
+                let quota = percent as i64 * 1000;
+                cpu_controller = cpu_controller.quota(quota);
+                cpu_controller = cpu_controller.period(100_000);
+                cpu_controller
+            } else {
+                cpu_controller
+            };
+
+            cpu_controller.done()
         };
 
         let cg = match cg.build(
@@ -139,8 +161,7 @@ fn exec(args: Args, cgroup_dtor_error_rc: Rc<RefCell<Vec<String>>>) -> Result<Ex
             println!("Setting up chroot environment in {}", chroot_dir);
         }
 
-        crate::chrootprep::prepare_chroot_env(chroot_dir, &cmd_name, args.verbose)?;
-        crate::chrootprep::post_op(chroot_dir, args.verbose)?;
+        chroot_post_op(chroot_dir, args.verbose)?;
 
         let old_root_dir = format!("{}/tmp/old_root", chroot_dir);
         std::fs::create_dir_all(&old_root_dir)?;
@@ -171,8 +192,6 @@ fn exec(args: Args, cgroup_dtor_error_rc: Rc<RefCell<Vec<String>>>) -> Result<Ex
     let path = _cg_dtor.cg.path().to_string();
     let cgroup_procs_file_path = format!("/sys/fs/cgroup/{}/cgroup.procs", path);
 
-    // Write the PID to the cgroup procs file
-
     // Now spawn the command
     if args.verbose {
         println!("Spawning command: {:?}", cmd_name);
@@ -184,6 +203,7 @@ fn exec(args: Args, cgroup_dtor_error_rc: Rc<RefCell<Vec<String>>>) -> Result<Ex
 
     cmd.args(cmd_args);
 
+    let new_userns = args.new_userns;
     unsafe {
         cmd.pre_exec(move || {
             {
@@ -193,7 +213,7 @@ fn exec(args: Args, cgroup_dtor_error_rc: Rc<RefCell<Vec<String>>>) -> Result<Ex
                     nix::fcntl::OFlag::O_WRONLY,
                     nix::sys::stat::Mode::empty(),
                 )?;
-                nix::unistd::write(fd, format!("{}", std::process::id()).as_bytes())?;
+                nix::unistd::write(fd, b"0")?;
             } // fd is dropped and hence closed after write (which takes ownership)
 
             // Drop permissions before returning Ok(())
@@ -203,6 +223,15 @@ fn exec(args: Args, cgroup_dtor_error_rc: Rc<RefCell<Vec<String>>>) -> Result<Ex
             nix::unistd::setgroups(&[gid])?;
             nix::unistd::setgid(gid)?;
             nix::unistd::setuid(uid)?; // Technically unsound on glibc but we don't spawn any threads so this should(TM) be fine
+
+            // Enter new user namespace
+            if new_userns {
+                // Technically unsafe/unsound, but its not a very big deal
+                // as we've not yet called exec() and we don't spawn any threads
+                nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER)
+                .map_err(|e| format!("Failed to unshare USER namespace: {}", e))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            }
 
             Ok(())
         });
@@ -261,4 +290,92 @@ pub(crate) fn main(args: Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
             return Err("Process terminated by signal".into());
         }
     }
+}
+
+fn chroot_post_op(dir: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Enter new PID/CGROUP namespace
+    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)
+    .map_err(|e| format!("Failed to enter new mount namespace: {}", e))?;
+
+    // TODO: Support NEWCGROUP as well soon
+    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWPID)
+        .map_err(|e| format!("Failed to unshare PID namespace: {}", e))?;
+    
+    mount::mount(None::<&str>, "/", None::<&str>, mount::MsFlags::MS_REC | mount::MsFlags::MS_PRIVATE, None::<&str>)?;
+    mount::mount(Some(dir), dir, None::<&str>, mount::MsFlags::MS_BIND, None::<&str>)?;
+
+    let proc_target = format!("{}/proc", dir);
+
+    // Check if proc is already mounted
+    if nix::sys::statfs::statfs(std::path::Path::new(&proc_target))?.filesystem_type() == nix::sys::statfs::PROC_SUPER_MAGIC {
+        panic!("Proc already mounted in chroot, cannot continue for security reasons");
+    }
+
+    if verbose {
+        println!("Mounting proc filesystem to {}", proc_target);
+    }
+
+    nix::mount::mount(
+        Some("proc"),
+        std::path::Path::new(&proc_target),
+        Some("proc"),
+        nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NOEXEC | nix::mount::MsFlags::MS_NODEV,
+        None::<&str>,
+    )?;
+
+    // Check if sys is mounted
+    let sys_target = format!("{}/sys", dir);
+    if nix::sys::statfs::statfs(std::path::Path::new(&sys_target))?.filesystem_type() == nix::sys::statfs::SYSFS_MAGIC {
+        panic!("Sysfs already mounted in chroot, cannot continue for security reasons");
+    }
+
+    if verbose {
+        println!("Mounting sys filesystem to {}", sys_target);
+    }
+
+    nix::mount::mount(
+        Some("sys"),
+        std::path::Path::new(&sys_target),
+        Some("sysfs"),
+        nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NOEXEC | nix::mount::MsFlags::MS_NODEV,
+        None::<&str>,
+    )?;
+
+    // Mount cgroup2 to /sys/fs/cgroup
+    let cgroup_mount_point = format!("{}/sys/fs/cgroup", dir);
+    if verbose {
+        println!("Mounting cgroup2 filesystem to {}", cgroup_mount_point);
+    }
+
+    nix::mount::mount(
+        Some("cgroup2"),
+        std::path::Path::new(&cgroup_mount_point),
+        Some("cgroup2"),
+        nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NOEXEC | nix::mount::MsFlags::MS_NODEV,
+        None::<&str>,
+    )?;
+
+    // Mount a tmpfs to /tmp
+    let tmp_target = format!("{}/tmp", dir);
+    if verbose {
+        println!("Mounting tmpfs to {}", tmp_target);
+    }
+
+    if nix::sys::statfs::statfs(std::path::Path::new(&tmp_target))?.filesystem_type() == nix::sys::statfs::TMPFS_MAGIC {
+        panic!("Tmpfs already mounted in chroot, cannot continue for security reasons");
+    }
+
+    nix::mount::mount(
+        Some("tmpfs"),
+        std::path::Path::new(&tmp_target),
+        Some("tmpfs"),
+        nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NOEXEC | nix::mount::MsFlags::MS_NODEV,
+        None::<&str>,
+    )?; 
+
+    if verbose {
+        println!("Chroot environment setup complete.");
+    }
+
+    Ok(())
 }

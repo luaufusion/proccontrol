@@ -1,14 +1,89 @@
-use nix::mount;
+/// Apply app specific patch operations after chroot is set up
+pub fn app_specific_post_op(dir: &str, bin: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Check if running on Ubuntu
+    let os_release = std::fs::read_to_string("/etc/os-release")?;
+    let is_ubuntu = os_release.lines().any(|line| line.starts_with("ID=ubuntu"));
+
+    fn copy_dir(dir: &str, dest: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if verbose {
+            println!("Copying directory {} to {}", dir, dest);
+        }
+        std::fs::create_dir_all(dest)?;
+
+        // Spawn a shell process and use cp -r to copy the directory
+        let status = std::process::Command::new("cp")
+            .arg("-r")
+            .arg(dir)
+            .arg(dest)
+            .status()?;
+
+        if !status.success() {
+            return Err(format!("Failed to copy directory {} to {}", dir, dest).into());
+        }
+
+        // Make sure to chown the copied files to uid:uid if needed
+        let uid = nix::unistd::getuid();
+        let euid = nix::unistd::geteuid();
+        if uid != euid {
+            if verbose {
+                println!("Changing ownership of copied files in {} to uid: {}", dest, uid);
+            }
+            let status = std::process::Command::new("chown")
+                .arg("-R")
+                .arg(format!("{}:{}", uid, uid))
+                .arg(dest)
+                .status()?;
+
+            if !status.success() {
+                return Err(format!("Failed to chown copied files in {}", dest).into());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ubuntu_app_specific(dir: &str, bin: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if verbose {
+            println!("Applying Ubuntu specific post operations for binary {}", bin);
+            println!("Current binary: {}", bin);
+        }
+        match bin {
+            "node" | "nodejs" => {
+                if verbose { 
+                    println!("Applying Ubuntu specific patches for Node.js");
+                }
+                // Nodejs needs /usr/share/nodejs copied over
+                copy_dir("/usr/share/nodejs", &format!("{}/usr/share", dir), verbose)?;
+            }
+            _ => {
+                println!("No Ubuntu specific post operations for binary `{}`", bin);
+            }
+        }        
+
+        Ok(())
+    }
+
+    if is_ubuntu {
+        ubuntu_app_specific(dir, bin, verbose)?;
+    }
+
+    Ok(())
+}
 
 /// Prepares a chroot environment in dir if needed
 pub fn prepare_chroot_env(dir: &str, bin: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Preparing chroot environment in {}", dir);
-    // if $dir/.prepared exists, return
-    let prep_marker = format!("{}/.prepared", dir);
-    if std::path::Path::new(&prep_marker).exists() {
-        return Ok(());
+    let uid = nix::unistd::getuid();
+    if uid.is_root() {
+        println!("Chroot creation must be executed by a non-root user although may be run within suid euid (for security reasons).");
+        return Err(format!("This program must not be run as the root user itself (uid!=0). Current uid={uid}").into());
     }
 
+    // Check if dir already exists
+    if std::path::Path::new(dir).exists() {
+        return Err(format!("Chroot directory {} already exists, refusing to continue for safety reasons", dir).into());
+    }
+
+    println!("Preparing chroot environment in {}", dir);
     // Resolve the command to an absolute path
     let cmd_path = if bin.contains("/") {
         std::path::PathBuf::from(bin)
@@ -110,98 +185,14 @@ pub fn prepare_chroot_env(dir: &str, bin: &str, verbose: bool) -> Result<(), Box
     }
     std::fs::copy(&bash_path, &dest)?;
 
-    // Create the .prepared marker file
-    std::fs::write(prep_marker, bin)?;
+    // Apply app specific post operations
+    if verbose {
+        println!("Applying app specific post operations");
+    }
+    app_specific_post_op(dir, bin, verbose)?;
 
     nix::unistd::sync();
     std::thread::sleep(std::time::Duration::from_millis(100));
     Ok(())
 }
 
-pub fn post_op(dir: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Enter new PID/CGROUP namespace
-    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)
-    .map_err(|e| format!("Failed to enter new mount namespace: {}", e))?;
-
-    // TODO: Support NEWCGROUP as well soon
-    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWPID)
-        .map_err(|e| format!("Failed to unshare PID namespace: {}", e))?;
-    
-    mount::mount(None::<&str>, "/", None::<&str>, mount::MsFlags::MS_REC | mount::MsFlags::MS_PRIVATE, None::<&str>)?;
-    mount::mount(Some(dir), dir, None::<&str>, mount::MsFlags::MS_BIND, None::<&str>)?;
-
-    let proc_target = format!("{}/proc", dir);
-
-    // Check if proc is already mounted
-    if nix::sys::statfs::statfs(std::path::Path::new(&proc_target))?.filesystem_type() == nix::sys::statfs::PROC_SUPER_MAGIC {
-        panic!("Proc already mounted in chroot, cannot continue for security reasons");
-    }
-
-    if verbose {
-        println!("Mounting proc filesystem to {}", proc_target);
-    }
-
-    nix::mount::mount(
-        Some("proc"),
-        std::path::Path::new(&proc_target),
-        Some("proc"),
-        nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NOEXEC | nix::mount::MsFlags::MS_NODEV,
-        None::<&str>,
-    )?;
-
-    // Check if sys is mounted
-    let sys_target = format!("{}/sys", dir);
-    if nix::sys::statfs::statfs(std::path::Path::new(&sys_target))?.filesystem_type() == nix::sys::statfs::SYSFS_MAGIC {
-        panic!("Sysfs already mounted in chroot, cannot continue for security reasons");
-    }
-
-    if verbose {
-        println!("Mounting sys filesystem to {}", sys_target);
-    }
-
-    nix::mount::mount(
-        Some("sys"),
-        std::path::Path::new(&sys_target),
-        Some("sysfs"),
-        nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NOEXEC | nix::mount::MsFlags::MS_NODEV,
-        None::<&str>,
-    )?;
-
-    // Mount cgroup2 to /sys/fs/cgroup
-    let cgroup_mount_point = format!("{}/sys/fs/cgroup", dir);
-    if verbose {
-        println!("Mounting cgroup2 filesystem to {}", cgroup_mount_point);
-    }
-
-    nix::mount::mount(
-        Some("cgroup2"),
-        std::path::Path::new(&cgroup_mount_point),
-        Some("cgroup2"),
-        nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NOEXEC | nix::mount::MsFlags::MS_NODEV,
-        None::<&str>,
-    )?;
-
-    // Mount a tmpfs to /tmp
-    let tmp_target = format!("{}/tmp", dir);
-    if verbose {
-        println!("Mounting tmpfs to {}", tmp_target);
-    }
-
-    if nix::sys::statfs::statfs(std::path::Path::new(&tmp_target))?.filesystem_type() == nix::sys::statfs::TMPFS_MAGIC {
-        panic!("Tmpfs already mounted in chroot, cannot continue for security reasons");
-    }
-
-    nix::mount::mount(
-        Some("tmpfs"),
-        std::path::Path::new(&tmp_target),
-        Some("tmpfs"),
-        nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NOEXEC | nix::mount::MsFlags::MS_NODEV,
-        None::<&str>,
-    )?; 
-
-    if verbose {
-        println!("Chroot environment setup complete.");
-    }
-
-    Ok(())
-}
