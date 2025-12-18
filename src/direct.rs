@@ -161,7 +161,7 @@ fn exec(args: Args, cgroup_dtor_error_rc: Rc<RefCell<Vec<String>>>) -> Result<Ex
             println!("Setting up chroot environment in {}", chroot_dir);
         }
 
-        chroot_post_op(chroot_dir, args.verbose)?;
+        chroot_env_setup(chroot_dir, args.verbose)?;
 
         let old_root_dir = format!("{}/tmp/old_root", chroot_dir);
         std::fs::create_dir_all(&old_root_dir)?;
@@ -292,7 +292,7 @@ pub(crate) fn main(args: Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 }
 
-fn chroot_post_op(dir: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn chroot_env_setup(dir: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Enter new PID/CGROUP namespace
     nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)
     .map_err(|e| format!("Failed to enter new mount namespace: {}", e))?;
