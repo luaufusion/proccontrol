@@ -1,4 +1,4 @@
-use std::{cell::RefCell, os::unix::process::CommandExt, process::{ExitCode, ExitStatus}, rc::Rc};
+use std::{cell::RefCell, fs::File, io::Write, os::unix::process::CommandExt, process::{ExitCode, ExitStatus}, rc::Rc};
 use nix::mount;
 
 
@@ -132,6 +132,7 @@ fn exec(args: Args, cgroup_dtor_error_rc: Rc<RefCell<Vec<String>>>) -> Result<Ex
 
     let gid = nix::unistd::getgid();
     let egid = nix::unistd::getegid();
+    let pid = nix::unistd::getpid();
 
     if args.verbose {
         println!("Current groupid: {}, effective groupid {}", gid, egid);
@@ -187,10 +188,30 @@ fn exec(args: Args, cgroup_dtor_error_rc: Rc<RefCell<Vec<String>>>) -> Result<Ex
         cmd_name = "/bin/".to_owned() + &cmd_name;
     }
 
+    // Setup cgroup for process
     let cgroup = setup_cgroup(&args)?;
-    let _cg_dtor = CgroupDtor { cg: cgroup, error_rc: cgroup_dtor_error_rc };
-    let path = _cg_dtor.cg.path().to_string();
+    let path = cgroup.path().to_string();
+    //let _cg_dtor = CgroupDtor { cg: cgroup, error_rc: cgroup_dtor_error_rc };
     let cgroup_procs_file_path = format!("/sys/fs/cgroup/{}/cgroup.procs", path);
+
+    {
+        let mut fd = File::create(cgroup_procs_file_path).map_err(|e| format!("failed to open cgroup file: {e:?}"))?;
+        fd.write_all(pid.to_string().as_bytes()).map_err(|e| format!("failed to write to cgroup file: {e:?}"))?;
+    }
+
+    // Drop permissions and perform any userns changes here
+    nix::unistd::setgroups(&[gid])?;
+    nix::unistd::setgid(gid)?;
+    nix::unistd::setuid(uid)?; // Technically unsound on glibc but we don't spawn any threads so this should(TM) be fine
+
+    // Enter new user namespace
+    if args.new_userns {
+        // Technically unsafe/unsound, but its not a very big deal
+        // as we've not yet called exec() and we don't spawn any threads
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER)
+        .map_err(|e| format!("Failed to unshare USER namespace: {}", e))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    }
 
     // Now spawn the command
     if args.verbose {
@@ -198,66 +219,9 @@ fn exec(args: Args, cgroup_dtor_error_rc: Rc<RefCell<Vec<String>>>) -> Result<Ex
     }
 
     let cmd_args = &args.command[1..];
-
     let mut cmd = std::process::Command::new(cmd_name);
-
     cmd.args(cmd_args);
-
-    let new_userns = args.new_userns;
-    unsafe {
-        cmd.pre_exec(move || {
-            {
-                // Because rust File is not guaranteed to be async signal safe, we need to use raw nix
-                let fd = nix::fcntl::open(
-                    cgroup_procs_file_path.as_str(),
-                    nix::fcntl::OFlag::O_WRONLY,
-                    nix::sys::stat::Mode::empty(),
-                )?;
-                nix::unistd::write(fd, b"0")?;
-            } // fd is dropped and hence closed after write (which takes ownership)
-
-            // Drop permissions before returning Ok(())
-            //
-            // Once Ok has been returned, exec() will be called, after which
-            // we cannot control what the process does anymore
-            nix::unistd::setgroups(&[gid])?;
-            nix::unistd::setgid(gid)?;
-            nix::unistd::setuid(uid)?; // Technically unsound on glibc but we don't spawn any threads so this should(TM) be fine
-
-            // Enter new user namespace
-            if new_userns {
-                // Technically unsafe/unsound, but its not a very big deal
-                // as we've not yet called exec() and we don't spawn any threads
-                nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER)
-                .map_err(|e| format!("Failed to unshare USER namespace: {}", e))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            }
-
-            Ok(())
-        });
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            return Err(format!("Failed to spawn command: {e}").into());
-        }
-    };
-
-    if args.verbose {
-        println!("Spawned child process with PID: {}", child.id());
-    }
-
-    println!("cgroup tasks: {:?}", _cg_dtor.cg.tasks());
-
-    match child.wait() {
-        Err(e) => {
-            return Err(format!("Failed to wait for command: {e}").into());
-        }
-        Ok(exit_status) => {
-            return Ok(exit_status);
-        }
-    }
+    Err(format!("failed to run command: {}", cmd.exec().to_string()).into())
 }
 
 pub(crate) fn main(args: Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
